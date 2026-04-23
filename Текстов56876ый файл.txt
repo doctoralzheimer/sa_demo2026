@@ -1,0 +1,490 @@
+## Полный гайд: проверка текущих настроек, настройка и удаление преднастроек
+
+### 1. Samba DC (BR‑SRV)
+
+**Проверка текущих настроек (что уже настроено):**
+```bash
+# Проверка статуса служб
+sudo systemctl status samba smbd nmbd
+
+# Информация о домене (если создан)
+sudo samba-tool domain info au-team.irpo 2>/dev/null || echo "Домен не настроен"
+
+# Список существующих пользователей
+sudo samba-tool user list 2>/dev/null || echo "Пользователи не найдены"
+
+# Список групп
+sudo samba-tool group list 2>/dev/null || echo "Группы не найдены"
+
+
+# Проверка присоединения к домену (на клиентах)
+sudo net ads testjoin 2>/dev/null && echo "Машина в домене" || echo "Машина не в домене"
+```
+
+**Настройка (если ничего не настроено):**
+```bash
+# Установка Samba DC
+sudo apt-get install -y samba task-samba-dc
+
+# Создание домена
+sudo samba-tool domain provision --use-rfc2307 --domain=AU-TEAM --realm=au-team.irpo --server-role=dc --dns-backend=SAMBA_INTERNAL
+
+
+# Запуск служб
+sudo systemctl enable --now samba
+
+
+# Добавление машин в домен (выполняется на клиентах HQ‑CLI и BR‑CLI)
+sudo net ads join -U Administrator@au-team.irpo
+
+# Создание пользователей и групп
+for i in {1..10}; do
+  sudo samba-tool user create hq_user$i P@ssw0rd --given-name="HQ User $i"
+  sudo samba-tool group addmembers group_hq hq_user$i
+done
+
+for i in {1..8}; do
+  sudo samba-tool user create br_user$i P@ssw0rd --given-name="BR User $i"
+  sudo samba-tool group addmembers group_br br_user$i
+done
+```
+
+**Проверка работоспособности после настройки:**
+```bash
+# Статус служб
+sudo systemctl status samba
+
+# Информация о домене
+sudo samba-tool domain info au-team.irpo
+
+# Список пользователей
+sudo samba-tool user list
+
+# Члены групп
+sudo samba-tool group members group_hq
+sudo samba-tool group members group_br
+
+# Проверка присоединения клиентов
+sudo net ads testjoin
+```
+
+**Удаление преднастроек (если нужно сбросить):**
+```bash
+sudo systemctl stop samba smbd nmbd
+sudo apt-get remove --purge samba task-samba-dc -y
+sudo apt-get autoremove -y
+sudo rm -rf /etc/samba/ /var/lib/samba/
+sudo net ads leave -U Administrator 2>/dev/null || true
+```
+
+---
+
+### 2. RAID 1 (HQ‑SRV)
+
+**Проверка текущих настроек:**
+```bash
+# Состояние RAID‑массивов
+cat /proc/mdstat
+
+# Детализация массива (если существует)
+sudo mdadm --detail /dev/md0 2>/dev/null || echo "Массив не создан"
+
+# Монтирование
+df -h | grep raid1
+mount | grep raid1
+
+# Конфигурация в файле
+sudo cat /etc/mdadm/mdadm.conf 2>/dev/null || echo "Конфигурационный файл не найден"
+```
+
+**Настройка (если RAID не создан):**
+```bash
+# Создание RAID 1
+sudo mdadm --create --verbose /dev/md0 --level=1 --raid-devices=2 /dev/sdb /dev/sdc
+
+# Сохранение конфигурации
+sudo mdadm --detail --scan | sudo tee -a /etc/mdadm/mdadm.conf
+
+# Файловая система
+sudo mkfs.ext3 /dev/md0
+
+# Монтирование
+sudo mkdir -p /raid1
+echo "/dev/md0 /raid1 ext3 defaults 0 0" | sudo tee -a /etc/fstab
+sudo mount -a
+```
+
+**Проверка работоспособности после настройки:**
+```bash
+cat /proc/mdstat
+sudo mdadm --detail /dev/md0
+df -h | grep raid1
+mount | grep raid1
+```
+
+**Удаление преднастроек:**
+```bash
+sudo umount /raid1 2>/dev/null || true
+sudo mdadm --stop /dev/md0 2>/dev/null || true
+sudo mdadm --zero-superblock /dev/sdb /dev/sdc 2>/dev/null || true
+sudo sed -i '/md0/d' /etc/mdadm/mdadm.conf
+sudo rmdir /raid1 2>/dev/null || true
+sudo sed -i '/raid1/d' /etc/fstab
+```
+
+---
+
+### 3. NFS (HQ‑SRV и клиенты)
+
+**Проверка текущих настроек:**
+```bash
+# На сервере — статус службы и экспортируемые папки
+sudo systemctl status nfs-server 2>/dev/null || echo "NFS не установлен"
+sudo exportfs -v 2>/dev/null || echo "Экспортируемые папки не настроены"
+
+# На клиентах — смонтированные папки
+df -h | grep mnt/share 2>/dev/null || echo "Папка не смонтирована"
+```
+
+**Настройка (если NFS не настроен):**
+```bash
+# Сервер
+sudo apt-get install -y nfs-kernel-server
+sudo mkdir -p /raid1/share
+echo "/raid1/share 192.168.1.0/24(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
+sudo exportfs -a
+sudo systemctl restart nfs-server
+
+# Клиенты (HQ‑CLI, BR‑CLI)
+sudo mkdir -p /mnt/share
+echo "HQ-SRV:/raid1/share /mnt/share nfs defaults 0 0" | sudo tee -a /etc/fstab
+sudo mount -a
+```
+
+**Проверка работоспособности после настройки:**
+```bash
+# На сервере
+sudo exportfs -v
+
+# На клиенте
+df -h | grep mnt/share
+echo "test" | sudo tee /mnt/share/test.txt
+ls -la /raid1/share/
+```
+
+**Удаление преднастроек:**
+```bash
+# Сервер
+sudo systemctl stop nfs-server
+sudo apt-get remove --purge nfs-kernel-server -y
+sudo sed -i '/raid1\/share/d' /etc/exports
+
+# Клиенты
+sudo umount /mnt/share 2>/dev/null || true
+sudo sed -i '/mnt\/share/d' /etc/fstab
+sudo apt-get remove --purge nfs-common -y
+```
+
+---
+
+### 4. Chrony (ISP и клиенты)
+
+**Проверка текущих настроек:**
+```bash
+# На сервере
+chronyc sources 2>/dev/null || echo "Chrony не настроен"
+
+# На клиентах
+chronyc tracking 2>/dev/null || echo "Клиент не синхронизирован"
+timedatectl status | grep "NTP"
+```
+
+**Настройка (если Chrony не настроен):**
+```bash
+# Сервер (ISP)
+sudo apt-get install -y chrony
+echo "server pool.ntp.org iburst
+stratumweight 5
+allow 192.168.0.0/16" | sudo tee /etc/chrony/chrony.conf
+sudo systemctl enable --now chronyd
+
+# Клиенты
+echo "server ISP iburst" | sudo tee /etc/chrony/chrony.conf
+sudo systemctl restart chronyd
+```
+
+**Проверка работоспособности после настройки:**
+```bash
+chronyc sources
+chronyc tracking
+timedatectl status
+```
+
+**Удаление преднастроек:**
+```bash
+sudo systemctl stop chronyd
+sudo systemctl disable chronyd
+sudo apt-get remove --purge chrony -y
+```
+
+---
+
+### 5. Ansible (BR‑SRV)
+
+**Проверка текущих настроек:**
+```bash
+ansible --version 2>/dev/null || echo "Ansible не установлен"
+cat /etc/ansible/hosts 2>/dev/null || echo "Инвентарь не создан"
+```
+
+### 5. Ansible (BR‑SRV) (продолжение)
+
+
+**Настройка (если Ansible не настроен):**
+```bash
+sudo apt-get install -y ansible
+cat > /etc/ansible/hosts << EOF
+[servers]
+HQ-SRV ansible_host=192.168.1.10
+HQ-CLI ansible_host=192.168.1.11
+HQ-RTR ansible_host=192.168.1.12
+BR-RTR ansible_host=192.168.2.12
+BR-CLI ansible_host=192.168.2.11
+
+[clients]
+HQ-CLI
+BR-CLI
+EOF
+```
+
+**Проверка работоспособности после настройки:**
+```bash
+# Полный список хостов в инвентаре
+ansible-inventory -i /etc/ansible/hosts --list
+
+
+# Проверка связи со всеми серверами
+ansible all -m ping
+
+# Проверка связи с группой серверов
+ansible servers -m ping
+
+# Проверка выполнения простой команды на всех хостах
+ansible all -a "uname -a"
+```
+
+**Удаление преднастроек:**
+```bash
+# Остановка служб (если запущены)
+sudo systemctl stop ansible 2>/dev/null || true
+
+# Удаление пакета Ansible
+sudo apt-get remove --purge ansible -y
+
+# Очистка конфигурационных файлов и директорий
+sudo rm -rf /etc/ansible
+
+# Проверка удаления
+ansible --version 2>/dev/null && echo "Ansible всё ещё установлен" || echo "Ansible успешно удалён"
+```
+
+---
+
+### 6. Docker (BR‑SRV)
+
+**Проверка текущих настроек:**
+```bash
+# Проверка установки Docker
+docker --version 2>/dev/null || echo "Docker не установлен"
+
+# Список запущенных контейнеров
+docker ps 2>/dev/null || echo "Контейнеры не запущены"
+
+# Список образов
+docker images 2>/dev/null | grep -E "site_latest|mariadb_latest" || echo "Образы не найдены"
+
+# Статус службы Docker
+sudo systemctl status docker 2>/dev/null || echo "Служба Docker не запущена"
+```
+
+
+**Настройка (если Docker не настроен):**
+```bash
+# Установка Docker
+sudo apt-get install -y docker.io
+sudo systemctl enable docker
+sudo systemctl start docker
+
+# Монтирование ISO и загрузка образов
+sudo mount /path/to/Additional.iso /mnt
+sudo docker load < /mnt/docker/site_latest.tar
+sudo docker load < /mnt/docker/mariadb_latest.tar
+
+# Создание docker-compose.yml
+cat > docker-compose.yml << EOF
+version: '3'
+services:
+  db:
+    image: mariadb_latest
+    environment:
+      MYSQL_ROOT_PASSWORD: P@ssw0rd
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: test
+      MYSQL_PASSWORD: P@ssw0rd
+  testapp:
+    image: site_latest
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+EOF
+
+# Запуск контейнеров
+sudo docker-compose up -d
+```
+
+**Проверка работоспособности после настройки:**
+```bash
+# Список запущенных контейнеров
+docker ps
+
+# Логи приложения
+docker logs testapp 2>/dev/null || echo "Контейнер testapp не найден"
+docker logs db 2>/dev/null || echo "Контейнер db не найден"
+
+# Проверка порта
+netstat -tlnp | grep 8080
+
+# Тест доступности веб‑приложения
+curl http://localhost:8080 2>/dev/null && echo "Веб‑приложение доступно" || echo "Веб‑приложение недоступно"
+
+# Проверка работы БД
+docker exec db mysql -u test -pP@ssw0rd -e "SHOW DATABASES;" 2>/dev/null || echo "Ошибка подключения к БД"
+```
+
+**Удаление преднастроек:**
+```bash
+# Остановка и удаление контейнеров
+sudo docker-compose down
+
+# Удаление образов
+docker rmi site_latest mariadb_latest 2>/dev/null || true
+
+# Отмонтирование ISO
+sudo umount /mnt 2>/dev/null || true
+
+# Удаление Docker
+sudo apt-get remove --purge docker.io -y
+sudo apt-get autoremove -y
+
+# Очистка данных Docker
+sudo rm -rf /var/lib/docker
+```
+
+---
+
+### 7. Веб‑приложение на HQ‑SRV
+
+
+**Проверка текущих настроек:**
+```bash
+# Проверка установки Apache и MariaDB
+apache2 -v 2>/dev/null || echo "Apache не установлен"
+mysql --version 2>/dev/null || echo "MariaDB не установлена"
+
+# Статус служб
+sudo systemctl status apache2 2>/dev/null || echo "Apache не запущен"
+sudo systemctl status mariadb 2>/dev/null || echo "MariaDB не запущена"
+
+# Проверка файлов веб‑приложения
+ls -la /var/www/html/ 2>/dev/null || echo "Файлы веб‑приложения не найдены"
+```
+
+**Настройка (если веб‑приложение не настроено):**
+```bash
+# Установка Apache и MariaDB
+sudo apt-get install -y apache2 mariadb-server
+
+# Копирование файлов веб‑приложения из ISO
+sudo mount /path/to/Web.iso /mnt
+sudo cp /mnt/web/index.php /var/www/html/
+sudo cp -r /mnt/web/images /var/www/html/
+
+# Импорт базы данных
+mysql -u root -p < /mnt/web/dump.sql 2>/dev/null || echo "Ошибка импорта БД"
+
+# Создание пользователя БД
+mysql -u root -e "CREATE USER 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';"
+mysql -u root -e "GRANT ALL PRIVILEGES ON testdb.* TO 'web'@'localhost';"
+mysql -u root -e "FLUSH PRIVILEGES;"
+
+# Перезапуск Apache
+sudo systemctl restart apache2
+```
+
+**Проверка работоспособности после настройки:**
+```bash
+# Статус веб‑сервера
+sudo systemctl status apache2
+
+# Доступ к веб‑сайту
+curl http://localhost 2>/dev/null && echo "Веб‑сайт доступен" || echo "Веб‑сайт недоступен"
+
+# Проверка подключения к БД
+mysql -u web -pP@ssw0rd -e "USE testdb; SHOW TABLES;" 2>/dev/null && echo "БД работает" || echo "Ошибка подключения к БД"
+
+# Логи Apache
+tail -n 20 /var/log/apache2/error.log
+```
+
+**Удаление преднастроек:**
+```bash
+# Остановка служб
+sudo systemctl stop apache2 mariadb
+
+# Удаление пакетов
+sudo apt-get remove --purge apache2 mariadb-server -y
+sudo apt-get autoremove -y
+
+# Очистка файлов веб‑приложения
+sudo rm -rf /var/www/html/*
+
+# Очистка БД
+sudo rm -rf /var/lib/mysql/*
+
+# Отмонтирование ISO
+sudo umount /mnt 2>/dev/null || true
+```
+
+---
+
+## Общий чек‑лист проверки работоспособности всей инфраструктуры
+
+После завершения всех настроек выполните проверку:
+
+```bash
+echo "=== ПРОВЕРКА ИНФРАСТРУКТУРЫ ==="
+
+
+echo "1. Samba DC:"
+sudo samba-tool domain info au-team.irpo 2>/dev/null && echo "✓ Домен активен" || echo "✗ Домен не настроен"
+
+echo "2. RAID:"
+cat /proc/mdstat | grep md0 && echo "✓ RAID работает" || echo "✗ RAID не настроен"
+
+echo "3. NFS:"
+df -h | grep mnt/share && echo "✓ NFS смонтирован" || echo "✗ NFS не работает"
+
+echo "4. Chrony:"
+chronyc sources 2>/dev/null && echo "✓ Синхронизация времени работает" || echo "✗ Время не синхронизируется"
+
+
+echo "5. Ansible:"
+ansible all -m ping -i /etc/ansible/hosts 2>/dev/null && echo "✓ Ansible работает" || echo "✗ Ansible не отвечает"
+
+echo "6. Docker:"
+docker ps | grep testapp && echo "✓ Docker‑контейнеры запущены" || echo "✗ Docker не работает"
+
+echo "7. Веб‑приложение:"
+curl -I http://localhost:8080 2>/dev/null && echo "✓ Веб‑сайт доступен" || echo "✗ Веб‑сайт недоступен"
+``
